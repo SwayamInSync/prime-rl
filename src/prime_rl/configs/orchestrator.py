@@ -616,6 +616,19 @@ class BufferConfig(BaseConfig):
         ),
     ] = None
 
+    sequential: Annotated[
+        bool,
+        Field(
+            description=(
+                "If True, examples are drawn in dataset order instead of random sampling. "
+                "Each example is consumed once per epoch (cyclically). Use this to preserve "
+                "curriculum-learning order specified in the source dataset. Note: examples "
+                "evicted into easy/hard pools are skipped on subsequent passes; the cursor "
+                "automatically wraps over the remaining 'normal' pool."
+            ),
+        ),
+    ] = False
+
     easy_threshold: Annotated[
         float | None,
         Field(

@@ -38,9 +38,16 @@ class _EnvBuffer:
         assert "prompt" in dataset.column_names, f"Dataset for {env.name} must contain a `prompt` column."
 
         self.examples: dict[int, dict] = {}
+        # Preserve the original dataset ordering so curriculum-style training can
+        # iterate examples in the order specified in the source JSON. Python
+        # dict preserves insertion order; we additionally maintain an explicit
+        # cursor + ordered key list for sequential sampling.
+        self._order: list[int] = []
         for example in map(partial(cast, dict), dataset):
             example["env_name"] = env.name
             self.examples[example["example_id"]] = example
+            self._order.append(example["example_id"])
+        self._cursor: int = 0
 
         self.easy_examples: list[dict] = []
         self.hard_examples: list[dict] = []
@@ -56,6 +63,18 @@ class _EnvBuffer:
         return self.num_normal + len(self.easy_examples) + len(self.hard_examples)
 
     def sample_example(self) -> dict:
+        if self.config.sequential:
+            # Walk the ordered key list, skipping ids that have been evicted
+            # into the easy/hard pools (so we never block on a dead key) and
+            # wrapping back to the start when we exhaust the normal pool.
+            n = len(self._order)
+            for _ in range(n):
+                key = self._order[self._cursor]
+                self._cursor = (self._cursor + 1) % n
+                if key in self.examples:
+                    return self.examples[key]
+            # All ordered keys have been evicted -- fall through to random
+            # sampling over whatever remains (defensive; usually impossible).
         key = random.choice(tuple(self.examples))
         return self.examples[key]
 
