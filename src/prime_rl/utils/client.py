@@ -185,7 +185,12 @@ def setup_admin_clients(client_config: ClientConfig) -> list[AsyncClient]:
         return AsyncClient(
             base_url=base_url,
             headers=headers,
-            limits=httpx.Limits(max_connections=4, max_keepalive_connections=1),
+            # Admin endpoints (pause / resume / update_weights / load_lora_adapter) fire at most
+            # once per training step on localhost. Disabling HTTP keep-alive eliminates the
+            # stale-connection race where the server closes an idle keep-alive socket and the
+            # next admin POST raises httpx.RemoteProtocolError mid-request. The cost is one
+            # extra TCP handshake per call (microseconds on loopback).
+            limits=httpx.Limits(max_connections=4, max_keepalive_connections=0),
             timeout=httpx.Timeout(None),
         )
 
@@ -240,11 +245,30 @@ async def check_health(
 NCCL_READY_MARKER = "NCCL_READY"
 
 
+def _is_retryable_admin_error(exception: BaseException) -> bool:
+    """Retry on transport-level failures (stale keep-alive connections, timeouts, resets)."""
+    if isinstance(exception, (httpx.TimeoutException, httpx.TransportError, httpx.RemoteProtocolError)):
+        return True
+    if isinstance(exception, httpx.HTTPStatusError):
+        # Retry on transient 5xx
+        return 500 <= exception.response.status_code < 600
+    return False
+
+
+_admin_retry = retry(
+    retry=retry_if_exception(_is_retryable_admin_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+    reraise=True,
+)
+
+
 async def _pause_engines(admin_clients: list[AsyncClient]) -> None:
     """Pause all inference engines, waiting for in-flight requests to drain."""
     logger = get_logger()
     logger.info("Pausing inference engines for weight update")
 
+    @_admin_retry
     async def _pause(client: AsyncClient) -> None:
         response = await client.post("/pause", params={"mode": "keep", "clear_cache": "false"})
         response.raise_for_status()
@@ -257,6 +281,7 @@ async def _resume_engines(admin_clients: list[AsyncClient]) -> None:
     """Resume all inference engines after weight update."""
     logger = get_logger()
 
+    @_admin_retry
     async def _resume(client: AsyncClient) -> None:
         response = await client.post("/resume")
         response.raise_for_status()
@@ -288,6 +313,7 @@ async def update_weights(
         await load_lora_adapter(admin_clients, lora_name, weight_dir)
     else:
 
+        @_admin_retry
         async def _update_weights(admin_client: AsyncClient, weight_dir: str | None) -> None:
             response = await admin_client.post("/update_weights", json={"weight_dir": weight_dir})
             response.raise_for_status()
