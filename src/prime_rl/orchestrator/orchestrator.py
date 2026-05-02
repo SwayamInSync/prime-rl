@@ -38,7 +38,7 @@ from prime_rl.configs.orchestrator import OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.envs import EvalEnv, EvalEnvs, TrainEnvs
-from prime_rl.orchestrator.filters import apply_filters, setup_filters
+from prime_rl.orchestrator.filters import apply_filters, select_useful_groups, setup_filters
 from prime_rl.orchestrator.scheduler import Scheduler
 from prime_rl.orchestrator.utils import (
     compute_teacher_logprobs,
@@ -413,46 +413,155 @@ async def orchestrate(config: OrchestratorConfig):
         # Update prev_ckpt_step for next iteration
         prev_ckpt_step = ckpt_step
 
-        # Schedule generating the training batch. Retry on empty-after-filter
-        # batches so the trainer never receives an empty batch.
+        # Schedule generating the training batch.
+        #
+        # Two modes:
+        #   (a) Legacy (config.dynamic_sampling.enabled == False): generate a
+        #       single batch; if every rollout was filtered, retry up to
+        #       MAX_EMPTY_BATCH_ATTEMPTS, else crash.
+        #   (b) DAPO-style dynamic sampling (enabled == True): keep generating
+        #       additional groups within the same step until at least
+        #       `target_useful_groups = batch_size // rollouts_per_example`
+        #       groups have at least one un-filtered rollout (i.e. group
+        #       advantage variance > 0), or until a hard cap is reached.
+        #       Trim to exactly `target_useful_groups` groups before shipping
+        #       to the trainer. Groups stay intact across iterations so per-
+        #       group advantages are unchanged when re-computed.
         generate_completions_time = 0.0
         train_rollouts: list[vf.RolloutOutput] = []
+        pool: list[vf.RolloutOutput] = []
         num_rollouts = 0
         num_unique_examples = 0
         n_trainable = 0
-        for attempt in range(MAX_EMPTY_BATCH_ATTEMPTS):
-            train_rollouts = await scheduler.generate_batch(step=progress.step)
+        ds_cfg = config.dynamic_sampling
+        K = config.rollouts_per_example
+        ds_enabled = ds_cfg.enabled
+        if ds_enabled:
+            if config.batch_size is None:
+                raise ValueError(
+                    "dynamic_sampling.enabled=true requires rollout-mode batching "
+                    "(batch_size set, not token_batch_size)."
+                )
+            if config.batch_size % K != 0:
+                raise ValueError(
+                    f"dynamic_sampling.enabled=true requires batch_size ({config.batch_size}) "
+                    f"to be a multiple of rollouts_per_example ({K})."
+                )
+            target_groups = config.batch_size // K
+            max_groups = max(target_groups, int(target_groups * ds_cfg.max_factor))
+            max_attempts = ds_cfg.max_attempts
+        else:
+            target_groups = 0
+            max_groups = 0
+            max_attempts = MAX_EMPTY_BATCH_ATTEMPTS
+
+        useful_groups = 0
+        attempt = 0
+        ds_total_attempts = 0
+        ds_padded_groups = 0
+        while True:
+            attempt += 1
+            ds_total_attempts = attempt
+            new_rollouts = await scheduler.generate_batch(step=progress.step)
             generate_completions_time += scheduler.last_batch_generation_time
+            pool.extend(new_rollouts)
 
-            # Compute advantages (in-place)
-            num_rollouts = len(train_rollouts)
-            num_unique_examples = len({(r["env_name"], r["example_id"]) for r in train_rollouts})
-            compute_advantages(train_rollouts, config.rollouts_per_example, config.advantage)
+            # Re-compute advantages over the whole pool. Each group is normalized
+            # independently inside compute_advantages (it reshapes to
+            # (num_groups, K)), so values for already-scored groups don't change
+            # — this is just a cheap idempotent recomputation for the new groups.
+            compute_advantages(pool, K, config.advantage)
+            apply_filters(rollout_filters, pool)
 
-            # Apply rollout filters — sets rollout["filters"] and rollout["is_filtered"]
-            apply_filters(rollout_filters, train_rollouts)
+            num_rollouts = len(pool)
+            n_trainable = sum(1 for r in pool if not r["is_filtered"])
 
-            n_trainable = sum(1 for r in train_rollouts if not r["is_filtered"])
-            if n_trainable > 0:
+            if not ds_enabled:
+                # Legacy path: a single trainable rollout is enough to ship.
+                if n_trainable > 0:
+                    train_rollouts = pool
+                    break
+                if attempt >= max_attempts:
+                    logger.error(
+                        f"Attempt {attempt}/{max_attempts} at step {progress.step} "
+                        f"filtered out all {num_rollouts} rollouts - crashing orchestrator"
+                    )
+                    reason = (
+                        f"All {num_rollouts} rollouts were filtered out on "
+                        f"{max_attempts} consecutive attempts at step {progress.step}"
+                    )
+                    evicted_path = config.output_dir / "control" / "evicted.txt"
+                    evicted_path.parent.mkdir(parents=True, exist_ok=True)
+                    evicted_path.write_text(reason)
+                    raise RuntimeError(reason)
+                logger.warning(
+                    f"Attempt {attempt}/{max_attempts} at step {progress.step} "
+                    f"filtered out all {num_rollouts} rollouts - retrying batch generation"
+                )
+                # Drop the unusable pool — legacy semantics treat each attempt as fresh.
+                pool = []
+                continue
+
+            # Dynamic sampling path: count groups with any trainable rollout.
+            n_groups = num_rollouts // K
+            assert n_groups * K == num_rollouts, (
+                f"pool size {num_rollouts} is not a multiple of rollouts_per_example {K}; "
+                "scheduler is expected to emit rollouts in whole groups"
+            )
+            useful_mask = [
+                any(not pool[g * K + i]["is_filtered"] for i in range(K))
+                for g in range(n_groups)
+            ]
+            useful_groups = sum(useful_mask)
+
+            if useful_groups >= target_groups:
+                logger.info(
+                    f"[dynamic_sampling] step {progress.step}: reached "
+                    f"{useful_groups}/{target_groups} useful groups after {attempt} attempt(s) "
+                    f"({n_groups} groups, {num_rollouts} rollouts generated)."
+                )
                 break
 
-            if attempt == MAX_EMPTY_BATCH_ATTEMPTS - 1:
-                logger.error(
-                    f"Attempt {attempt + 1}/{MAX_EMPTY_BATCH_ATTEMPTS} at step {progress.step} "
-                    f"filtered out all {num_rollouts} rollouts - crashing orchestrator"
+            if n_groups >= max_groups or attempt >= max_attempts:
+                logger.warning(
+                    f"[dynamic_sampling] step {progress.step}: cap reached "
+                    f"({useful_groups}/{target_groups} useful groups, {n_groups} groups, "
+                    f"{attempt}/{max_attempts} attempts, max_groups={max_groups}). "
+                    + (
+                        "Padding remainder with filtered groups."
+                        if ds_cfg.pad_with_filtered
+                        else "Shipping a smaller-than-batch batch."
+                    )
                 )
-                reason = (
-                    f"All {num_rollouts} rollouts were filtered out on "
-                    f"{MAX_EMPTY_BATCH_ATTEMPTS} consecutive attempts at step {progress.step}"
-                )
-                evicted_path = config.output_dir / "control" / "evicted.txt"
-                evicted_path.parent.mkdir(parents=True, exist_ok=True)
-                evicted_path.write_text(reason)
-                raise RuntimeError(reason)
+                break
 
-            logger.warning(
-                f"Attempt {attempt + 1}/{MAX_EMPTY_BATCH_ATTEMPTS} at step {progress.step} "
-                f"filtered out all {num_rollouts} rollouts - retrying batch generation"
+            logger.info(
+                f"[dynamic_sampling] step {progress.step}: {useful_groups}/{target_groups} "
+                f"useful groups after attempt {attempt}/{max_attempts} "
+                f"({n_groups}/{max_groups} groups). Sampling more."
+            )
+
+        # Selection: ship exactly target_groups groups (when DS enabled).
+        # Take useful groups in original arrival order to avoid reward-based
+        # selection bias; if short, optionally pad with filtered groups
+        # (their advantage is 0 so the trainer step contributes no gradient
+        # from them, but the batch shape stays fixed).
+        if ds_enabled:
+            train_rollouts, _, ds_padded_groups = select_useful_groups(
+                pool=pool,
+                rollouts_per_example=K,
+                target_groups=target_groups,
+                pad_with_filtered=ds_cfg.pad_with_filtered,
+            )
+            num_rollouts = len(train_rollouts)
+            n_trainable = sum(1 for r in train_rollouts if not r["is_filtered"])
+
+        num_unique_examples = len({(r["env_name"], r["example_id"]) for r in train_rollouts})
+
+        if num_rollouts == 0:
+            raise RuntimeError(
+                f"Orchestrator produced an empty batch at step {progress.step} "
+                "(dynamic_sampling cap reached with zero useful groups and pad_with_filtered=false)."
             )
 
         trainable_ratio = n_trainable / num_rollouts
@@ -715,6 +824,16 @@ async def orchestrate(config: OrchestratorConfig):
             # Rollout filter metrics (detection rate per filter + overall drop rate)
             "filters/all/is_filtered": results_df.is_filtered.astype(float).mean(),
             **{f"filters/all/{name}": filter_df[name].astype(float).mean() for name in filter_df.columns},
+            # Dynamic sampling metrics (DAPO-style oversampling).
+            "dynamic_sampling/enabled": float(ds_enabled),
+            "dynamic_sampling/attempts": float(ds_total_attempts),
+            "dynamic_sampling/useful_groups": float(useful_groups),
+            "dynamic_sampling/target_groups": float(target_groups),
+            "dynamic_sampling/padded_groups": float(ds_padded_groups),
+            "dynamic_sampling/pool_groups": float(len(pool) // K),
+            "dynamic_sampling/oversample_factor": (
+                (len(pool) // K) / target_groups if ds_enabled and target_groups > 0 else 1.0
+            ),
             # W&B axis
             "step": progress.step,
         }

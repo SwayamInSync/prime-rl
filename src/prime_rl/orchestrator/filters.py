@@ -186,3 +186,59 @@ def apply_filters(filters: list[RolloutFilter], rollouts: list[vf.RolloutOutput]
             f"Detected {total_detected}/{len(rollouts)} rollouts "
             f"({', '.join(f'{name}={c}' for name, c in counts.items() if c > 0)})" + enforced_msg
         )
+
+
+def select_useful_groups(
+    pool: list["vf.RolloutOutput"],
+    rollouts_per_example: int,
+    target_groups: int,
+    pad_with_filtered: bool,
+) -> tuple[list["vf.RolloutOutput"], list[bool], int]:
+    """DAPO-style group selection.
+
+    Pre-condition: ``apply_filters`` has been called on every rollout in ``pool``,
+    and ``len(pool) % rollouts_per_example == 0`` (groups stay intact).
+
+    Selection rule (deterministic, no randomness, no reward-based reordering):
+      1. Mark each group as *useful* iff at least one of its rollouts has
+         ``is_filtered == False``.
+      2. Take useful groups in arrival order until ``target_groups`` are
+         collected (or the supply is exhausted).
+      3. If still short of ``target_groups`` and ``pad_with_filtered`` is True,
+         pad from the head of the filtered groups (also in arrival order).
+      4. Restore arrival order in the shipped batch (avoids re-ordering bias
+         relative to other downstream metric aggregation).
+
+    Returns:
+      shipped: flat rollout list (length is a multiple of rollouts_per_example).
+      useful_mask: per-group usefulness flag for the *full* pool (len == n_groups).
+      padded_groups: number of filtered (zero-advantage) groups added as padding.
+    """
+    K = rollouts_per_example
+    if K <= 0:
+        raise ValueError(f"rollouts_per_example must be > 0, got {K}")
+    if len(pool) % K != 0:
+        raise ValueError(
+            f"pool size {len(pool)} is not a multiple of rollouts_per_example {K}; "
+            "groups must remain intact across the dynamic-sampling loop"
+        )
+    n_groups = len(pool) // K
+    useful_mask = [
+        any(not pool[g * K + i].get("is_filtered", False) for i in range(K))
+        for g in range(n_groups)
+    ]
+    useful_indices = [g for g in range(n_groups) if useful_mask[g]]
+    filtered_indices = [g for g in range(n_groups) if not useful_mask[g]]
+
+    chosen = useful_indices[:target_groups]
+    padded_groups = 0
+    if len(chosen) < target_groups and pad_with_filtered:
+        pad = filtered_indices[: target_groups - len(chosen)]
+        padded_groups = len(pad)
+        chosen.extend(pad)
+    chosen.sort()  # preserve arrival order in shipped batch
+
+    shipped: list = []
+    for g in chosen:
+        shipped.extend(pool[g * K : (g + 1) * K])
+    return shipped, useful_mask, padded_groups

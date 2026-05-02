@@ -804,6 +804,74 @@ FilterConfig: TypeAlias = Annotated[
 ]
 
 
+class DynamicSamplingConfig(BaseModel):
+    """DAPO-style dynamic sampling.
+
+    When enabled, the orchestrator keeps generating extra rollout groups within
+    a single training step until at least ``batch_size / rollouts_per_example``
+    *useful* groups (i.e. groups containing at least one rollout that survives
+    the enforcing filters — typically zero-advantage filtering) are available.
+    The trainer always receives exactly ``batch_size`` rollouts per step.
+
+    Bias / correctness guarantees (see implementation in orchestrator.py):
+      * Advantages are computed per group and groups are kept intact across
+        oversampling iterations, so re-computation across the growing pool
+        never changes a group's advantages.
+      * Useful groups are taken in original arrival order (no reward-based
+        re-ordering), avoiding selection bias toward easy/hard problems.
+      * Extra rollouts are produced under the same checkpoint within a step
+        (``scheduler.step`` is held constant), so no off-policy contamination
+        is introduced by oversampling itself.
+      * If the cap (``max_factor``) is hit before enough useful groups arrive,
+        the batch is padded with filtered (zero-advantage) groups so the
+        trainer always sees a fixed batch shape; padded groups contribute
+        zero gradient since their advantages are exactly zero.
+
+    Only valid for rollout-based batching (``batch_size`` set, not
+    ``token_batch_size``). Requires ``batch_size`` to be a multiple of
+    ``rollouts_per_example``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: Annotated[
+        bool,
+        Field(description="Master switch. When False, behavior is identical to legacy orchestrator."),
+    ] = False
+    max_factor: Annotated[
+        float,
+        Field(
+            ge=1.0,
+            description=(
+                "Hard upper bound on the *total* number of rollout groups generated for a step, "
+                "expressed as a multiple of the target group count (batch_size / rollouts_per_example). "
+                "max_factor=1 disables oversampling. max_factor=2 means at most 2× rollout cost per step."
+            ),
+        ),
+    ] = 2.0
+    max_attempts: Annotated[
+        int,
+        Field(
+            ge=1,
+            description=(
+                "Hard upper bound on the number of generate_batch() calls per step. Acts as a wall-clock "
+                "safety net independent of max_factor."
+            ),
+        ),
+    ] = 5
+    pad_with_filtered: Annotated[
+        bool,
+        Field(
+            description=(
+                "If True (default), when the cap is reached with fewer useful groups than target, "
+                "pad the batch with filtered (zero-advantage) groups so the trainer sees a fixed-size "
+                "batch. Padded groups contribute zero gradient. If False, ship only the useful groups "
+                "(producing a smaller-than-batch_size batch); use only if your trainer tolerates that."
+            ),
+        ),
+    ] = True
+
+
 class FileSystemWeightBroadcastConfig(BaseModel):
     """Configures the filesystem weight broadcast."""
 
@@ -933,6 +1001,9 @@ class OrchestratorConfig(BaseConfig):
 
     # Rollout filters (monitor by default, enforce optionally)
     filters: list[FilterConfig] = [GibberishFilterConfig(), RepetitionFilterConfig(), ZeroAdvantageFilterConfig()]
+
+    # DAPO-style dynamic sampling (oversample within a step until target useful groups are reached).
+    dynamic_sampling: DynamicSamplingConfig = DynamicSamplingConfig()
 
     # The logging configuration
     log: LogConfig = LogConfig()
