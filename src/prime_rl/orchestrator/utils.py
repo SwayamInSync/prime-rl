@@ -83,25 +83,40 @@ async def compute_teacher_logprobs(
     model_name: str,
     samples: list[TrainingSample],
 ) -> list[list[float]]:
-    """Compute teacher model logprobs for a batch of training samples via prefill."""
-    from prime_rl.inference.vllm.serving_generate import GenerateResponse
+    """Compute teacher model logprobs for a batch of training samples via prefill.
+
+    Uses raw httpx instead of openai SDK's typed `client.post(..., cast_to=...)`
+    because openai >=1.0 requires `cast_to` to subclass `openai.BaseModel`, but
+    `prime_rl.inference.vllm.serving_generate.GenerateResponse` subclasses
+    `pydantic.BaseModel` -> openai's _parse() raises TypeError on the response.
+    Direct httpx avoids the SDK type-cast layer entirely.
+    """
+    import httpx
 
     async def _compute_single(client_config: vf.ClientConfig, sample: TrainingSample) -> list[float]:
-        client = setup_openai_client(client_config)
+        # setup_openai_client is reused only to resolve base_url + api_key from
+        # ClientConfig (env-var lookup, etc.), then we speak raw HTTP.
+        oai_client = setup_openai_client(client_config)
+        base_url = str(oai_client.base_url).rstrip("/")
+        api_key = oai_client.api_key
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
 
-        response = await client.post(
-            "/generate",
-            cast_to=GenerateResponse,
-            body={
-                "model": model_name,
-                "prompt_token_ids": sample.prompt_ids + sample.completion_ids,
-                "max_tokens": 1,
-                "temperature": 1.0,
-                "top_p": 1.0,
-                "prompt_logprobs": True,
-            },
-        )
-        return [0.0 if lp is None else float(lp) for lp in response.prompt_logprobs or []]
+        async with httpx.AsyncClient(timeout=600.0) as http:
+            r = await http.post(
+                f"{base_url}/generate",
+                headers=headers,
+                json={
+                    "model": model_name,
+                    "prompt_token_ids": sample.prompt_ids + sample.completion_ids,
+                    "max_tokens": 1,
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "prompt_logprobs": True,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
+        return [0.0 if lp is None else float(lp) for lp in (data.get("prompt_logprobs") or [])]
 
     return await asyncio.gather(*[_compute_single(client, sample) for client, sample in zip(cycle(clients), samples)])
 

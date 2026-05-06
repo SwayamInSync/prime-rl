@@ -310,6 +310,27 @@ def train(config: TrainerConfig):
         load_data_time = time.perf_counter() - load_data_start_time
         logger.debug(f"Loaded batch in {load_data_time:.2f} seconds")
 
+        # Robustness: orchestrator can deliver an empty batch when ALL groups
+        # produced zero-advantage rollouts (e.g. every rollout in every group
+        # got the identical reward AND dynamic_sampling.max_factor was hit).
+        # See orchestrator.py: `Only 0/N rollouts in the batch are trainable`.
+        # Without this guard `seq_len = micro_batches[0]["input_ids"].shape[1]`
+        # crashes with IndexError, killing rank 0, dissolving NCCL, and tearing
+        # down the entire run. Skip the optimizer update for this step but
+        # still advance progress + scheduler so trainer/orchestrator stay in
+        # lockstep on step counters and the next broadcast happens normally.
+        if not micro_batches:
+            logger.warning(
+                f"Step {progress.step}: empty batch from orchestrator (0 trainable rollouts). "
+                "Skipping optimizer update; advancing scheduler and step counter."
+            )
+            scheduler.step()
+            progress.step += 1
+            is_first_step = False
+            if heart is not None:
+                heart.beat()
+            continue
+
         batch_size = len(micro_batches)
         memory_profiler = None
         if config.memory_profiler_path is not None:
